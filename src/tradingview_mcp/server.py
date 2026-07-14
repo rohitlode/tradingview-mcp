@@ -517,10 +517,22 @@ def multi_timeframe_analysis(symbol: str, exchange: str = "KUCOIN") -> dict:
     Args:
         symbol: Symbol — crypto: "BTCUSDT"; stocks: "COMI" (EGX), "THYAO" (BIST), "600519" (SSE), "300251" (SZSE), "2330" (TWSE), "3105" (TPEX), "GDX" (AMEX)
         exchange: Exchange — crypto: KUCOIN, BINANCE, MEXC; stocks: EGX, BIST, NASDAQ, NYSE, AMEX, NYSEARCA, PCX, SSE, SZSE, TWSE, TPEX
+
+    Returns:
+        dict on success. On total upstream failure (all 5 timeframes) returns a
+        structured error envelope: ``{"error": {"code": "ALL_BATCHES_FAILED", ...}}``.
     """
     exchange = sanitize_exchange(exchange, "KUCOIN")
     full_symbol = normalize_tradingview_symbol(symbol, exchange)
-    return run_multi_timeframe_analysis(full_symbol, exchange)
+    try:
+        return run_multi_timeframe_analysis(full_symbol, exchange)
+    except BatchExecutionError as e:
+        return make_error(
+            ErrorCode.ALL_BATCHES_FAILED, str(e),
+            batches_attempted=e.batches_attempted,
+            batches_failed=e.batches_failed,
+            first_error=e.first_error,
+        )
 
 
 # ── Sentiment & news tools ─────────────────────────────────────────────────────

@@ -937,6 +937,7 @@ def run_multi_timeframe_analysis(
 
     tf_results: dict = {}
     alignment_scores: list[int] = []
+    fetch_errors: list[str] = []
 
     # Fast-fail guards: 5 timeframes × (~5s retries + 15s cooldown) ≈ 100s
     # when upstream cliffs. Bail after N consecutive failures, or when the
@@ -963,6 +964,7 @@ def run_multi_timeframe_analysis(
                 pass
             for skip_tf in aborted_remaining:
                 tf_results[skip_tf] = {"error": "skipped: wall-clock budget exhausted"}
+                fetch_errors.append(f"{skip_tf}: wall-clock budget exhausted")
             break
 
         try:
@@ -1017,6 +1019,7 @@ def run_multi_timeframe_analysis(
             }
         except Exception as exc:
             tf_results[tf] = {"error": str(exc)}
+            fetch_errors.append(f"{tf}: {exc.__class__.__name__}: {exc}")
             consecutive_failures += 1
             if consecutive_failures >= max_consec:
                 try:
@@ -1029,7 +1032,26 @@ def run_multi_timeframe_analysis(
                 except Exception:
                     pass
                 _fill_skipped_tfs(tf_results, timeframes, "upstream cliff")
+                fetch_errors.append(
+                    f"upstream cliff: bailed after {consecutive_failures} consecutive failures"
+                )
                 break
+
+    # Real upstream failures happened and NOTHING usable came back — this is not
+    # a legitimate "MIXED/RANGING" market read, it's a degraded call. Raise the
+    # SAME BatchExecutionError sentinel volume_breakout_scan/fetch_trending_analysis
+    # already use for "every batch failed", so the multi_timeframe_analysis tool
+    # wrapper converts it to the standard {"error": {"code": "ALL_BATCHES_FAILED",
+    # ...}} envelope instead of silently returning a fabricated neutral result
+    # that looks identical to a real quiet market. Does NOT fire for "No data for
+    # {tf}" (illiquid/new symbol — a real response, not a fetch failure) or a
+    # partial result (some timeframes succeeded, alignment_scores is non-empty).
+    if not alignment_scores and fetch_errors:
+        raise BatchExecutionError(
+            batches_attempted=len(tf_results),
+            batches_failed=len(fetch_errors),
+            first_error=fetch_errors[0],
+        )
 
     total_score = sum(alignment_scores)
     all_bullish = all(s > 0 for s in alignment_scores) if alignment_scores else False
