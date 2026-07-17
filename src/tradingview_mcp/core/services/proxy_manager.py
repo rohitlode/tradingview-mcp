@@ -54,13 +54,32 @@ def is_proxy_configured() -> bool:
     return c["enabled"] and bool(c["prefix"]) and bool(c["password"])
 
 
+#: Webshare "-rotate" plans assign a literal per-account username ending in this
+#: suffix that already auto-rotates the exit IP on every new connection — appending
+#: our own numeric session id on top of it is rejected with 407 by Webshare's proxy
+#: auth (confirmed live 2026-07-16). Only prefixes WITHOUT this suffix use the
+#: sticky-session-by-number scheme below.
+_ROTATE_SUFFIX = "-rotate"
+
+
 def get_proxy_url() -> Optional[str]:
-    """Build a rotating proxy URL with a random sticky session. Returns None if not configured."""
+    """Build a rotating proxy URL. Returns None if not configured.
+
+    Two Webshare username schemes, auto-detected from the configured prefix:
+    - Prefix ends with "-rotate": used verbatim (Webshare rotates the exit IP
+      per connection on its own; no session id).
+    - Otherwise: a random sticky session id is appended (classic per-session
+      rotation across PROXY_SESSION_MIN..PROXY_SESSION_MAX).
+    """
     if not is_proxy_configured():
         return None
     c = _cfg()
-    session_id = random.randint(c["min"], c["max"])
-    return f"http://{c['prefix']}-{session_id}:{c['password']}@{c['host']}:{c['port']}"
+    if c["prefix"].endswith(_ROTATE_SUFFIX):
+        username = c["prefix"]
+    else:
+        session_id = random.randint(c["min"], c["max"])
+        username = f"{c['prefix']}-{session_id}"
+    return f"http://{username}:{c['password']}@{c['host']}:{c['port']}"
 
 
 def get_proxy() -> Optional[dict]:
