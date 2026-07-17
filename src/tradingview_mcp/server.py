@@ -133,7 +133,12 @@ def top_losers(exchange: str = "KUCOIN", timeframe: str = "15m", limit: int = 25
     timeframe = sanitize_timeframe(timeframe, "15m")
     limit = max(1, min(limit, 50))
     try:
-        rows = fetch_trending_analysis(exchange, timeframe=timeframe, limit=limit)
+        # ascending=True: sort the FULL universe ascending BEFORE truncating to
+        # limit, not after -- fetch_trending_analysis's own default sorts
+        # descending and truncates to `limit` first, which (when re-sorted
+        # ascending here) just reordered the same top-gainers subset and could
+        # never surface real losers. Fixed 2026-07-17.
+        rows = fetch_trending_analysis(exchange, timeframe=timeframe, limit=limit, ascending=True)
     except BatchExecutionError as e:
         return make_error(
             ErrorCode.ALL_BATCHES_FAILED, str(e),
@@ -141,8 +146,7 @@ def top_losers(exchange: str = "KUCOIN", timeframe: str = "15m", limit: int = 25
             batches_failed=e.batches_failed,
             first_error=e.first_error,
         )
-    rows.sort(key=lambda x: x["changePercent"])
-    return [{"symbol": r["symbol"], "changePercent": r["changePercent"], "indicators": dict(r["indicators"])} for r in rows[:limit]]
+    return [{"symbol": r["symbol"], "changePercent": r["changePercent"], "indicators": dict(r["indicators"])} for r in rows]
 
 
 @mcp.tool()

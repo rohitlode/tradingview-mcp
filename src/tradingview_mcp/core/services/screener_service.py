@@ -173,6 +173,7 @@ def fetch_trending_analysis(
     filter_type: str = "",
     rating_filter: int = None,
     limit: int = 50,
+    ascending: bool = False,
 ) -> List[Row]:
     """
     Fetch trending coins across all available symbols in batches of 200.
@@ -183,9 +184,15 @@ def fetch_trending_analysis(
         filter_type:   Optional filter mode ('rating').
         rating_filter: BB rating value to match when filter_type == 'rating'.
         limit:         Maximum rows to return.
+        ascending:     Sort direction BEFORE truncating to ``limit``. False (default)
+                        = descending (gainers first). True = ascending (losers first).
+                        Must be applied before the ``limit`` truncation, not after --
+                        sorting a caller's own already-descending-truncated slice
+                        ascending just reorders the same gainers subset and can never
+                        surface real losers (the bug this parameter fixes, 2026-07-17).
 
     Returns:
-        List of Row dicts sorted by changePercent descending.
+        List of Row dicts sorted by changePercent (direction per ``ascending``).
     """
     if not _TA_AVAILABLE:
         raise RuntimeError("tradingview_ta is missing; run `uv sync`.")
@@ -306,7 +313,7 @@ def fetch_trending_analysis(
             first_error=first_error or "unknown",
         )
 
-    all_coins.sort(key=lambda x: x["changePercent"], reverse=True)
+    all_coins.sort(key=lambda x: x["changePercent"], reverse=not ascending)
     return all_coins[:limit]
 
 
