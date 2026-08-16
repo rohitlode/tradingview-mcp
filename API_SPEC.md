@@ -108,6 +108,33 @@ bandwidth/request quota remaining. If you want that checked, the account email +
 wouldn't explain this cliff, since the scanner path that failed **doesn't use the proxy at
 all**.
 
+## Fix applied + re-verified live (2026-08-16, same day)
+
+All 6 previously-unproxied services (`screener_provider.py`, `options_service.py`,
+`extended_hours_service.py`, `bitcoin_market_service.py`, `news_service.py`, plus
+`backtest_service.py`'s direct-first-then-proxy-fallback pattern) now route through the
+Webshare proxy unconditionally when configured — see `CHANGELOG.md` `[Unreleased]` for the
+per-file diff. Pushed to `origin/main` (`722c9af`).
+
+Re-ran this exact 30-tool sequential test immediately after a service restart:
+**30/30 succeeded.** The two non-network items from the first run recurred identically
+(app-level bad-symbol-format input error on `volume_confirmation_analysis`; Reddit's own
+unauthenticated-403 giving 0 posts on `market_sentiment` — both pre-existing, neither
+caused by nor fixed by proxy routing). Every call that failed in the first run now
+succeeds with real data:
+
+- `egx_trade_plan` (the exact call that cliffed at #17 in the first run) — real COMI trade
+  plan returned.
+- `egx_fibonacci_retracement`, `multi_timeframe_analysis`, `combined_analysis`'s technical
+  leg — all real data, no `ALL_BATCHES_FAILED`.
+- `egx_market_overview`, `egx_sector_scanner`, `egx_index_analysis`, `egx_stock_screener`
+  (previously "No data returned for EGX stocks") — now return full real EGX data
+  (235-242 stocks scanned), confirming those "no data" responses were also downstream
+  symptoms of the same unproxied-scanner degradation, not legitimate empty results.
+
+Verified end-to-end with a live interception (`requests.post` spy) before the reconnect
+test: the scanner call is confirmed going out via `p.webshare.io:80`.
+
 ## Takeaway
 
 The proxy investment (Webshare rotating residential) protects the wrong upstream. It shields
