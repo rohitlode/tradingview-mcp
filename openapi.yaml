@@ -1,0 +1,1060 @@
+openapi: 3.0.3
+info:
+  title: tradingview-mcp
+  version: "0.8.1"
+  description: |
+    Full reference for all 31 tools exposed by the `tradingview-mcp` MCP server
+    (source: `src/tradingview_mcp/server.py`, one `@mcp.tool()` per operation below).
+
+    **This is NOT a literal REST API.** The server speaks MCP (Model Context Protocol)
+    over streamable-HTTP at `POST /mcp`, using a single JSON-RPC envelope for every
+    call — there is no real `/tools/top_gainers` HTTP route. Each path below is a
+    documentation convenience: `operationId` == the real MCP tool name, and the
+    `requestBody` schema == the real MCP tool's `arguments` schema. To actually call
+    a tool, wrap it in the envelope described in **Invocation** below. Rendered in
+    Swagger UI / Postman / Redoc, this still gives one browsable page per tool with
+    full params, descriptions, and example responses — which is the point: no more
+    re-deriving "what does this tool take/return" by trial and error.
+
+    ## Invocation
+
+    ```
+    POST http://127.0.0.1:8100/mcp
+    Content-Type: application/json
+
+    {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "method": "tools/call",
+      "params": {
+        "name": "top_gainers",
+        "arguments": { "exchange": "KUCOIN", "timeframe": "15m", "limit": 5 }
+      }
+    }
+    ```
+    Response comes back as `result.content[0].text` containing the JSON string shown
+    in each operation's example below. `tools/list` (no `arguments`) enumerates all 31
+    with their JSON-Schema `inputSchema` — this document is the human-readable version
+    of that same list plus real example output.
+
+    Via Claude Desktop / Claude Code, none of the above is manual — the `mcp-remote`
+    bridge in `claude_desktop_config.json` handles the envelope; tools are just called
+    by name (`mcp__tradingview-mcp__top_gainers`, etc.).
+
+    ## Upstream data sources & reliability
+
+    Five distinct upstreams back these 31 tools — see `API_SPEC.md` in this repo for
+    the full investigation (which tool hits which upstream, live rate-limit test
+    results, and the 2026-08-16 proxy fix that routed every one of them through the
+    Webshare rotating-residential proxy). Short version: crypto/EGX/multi-timeframe
+    tools hit `scanner.tradingview.com` (scraped, no official key); price/options/
+    backtest tools hit Yahoo Finance; `bitcoin_market_pulse` hits CoinGecko;
+    `market_sentiment` hits Reddit's unauthenticated JSON endpoints (currently 403s —
+    always returns 0 posts, tracked as a known upstream limitation, not a bug in this
+    server); `financial_news` pulls RSS + a CNBC search endpoint. All proxied as of
+    commit `722c9af`.
+
+    Every scanner-backed tool can return a **structured error envelope** instead of
+    data on a transient upstream outage:
+    ```json
+    { "error": { "code": "ALL_BATCHES_FAILED", "message": "...", "batches_attempted": 5, "batches_failed": 3, "first_error": "..." } }
+    ```
+    or, from the lower-level resilience layer directly:
+    ```json
+    { "error": "Analysis failed: Upstream TradingView scanner returned transient errors on all 3 attempts spanning 5s (JSONDecodeError(...)). This is typically a 30-90s empty-body outage at scanner.tradingview.com. Wait ~60s before retrying." }
+    ```
+    Both shapes are documented per-operation below as the `200` response's alternate
+    schema (MCP tools always return HTTP 200 at the transport level — failures are
+    encoded in the JSON payload, not the status code).
+
+servers:
+  - url: http://127.0.0.1:8100
+    description: Local tradingview-mcp instance (streamable-HTTP MCP, POST /mcp only)
+
+tags:
+  - name: Crypto Screener
+    description: scanner.tradingview.com-backed. Crypto exchanges (KuCoin, Binance, Bybit, MEXC) + global stock exchanges (NASDAQ, NYSE, BIST, SSE, SZSE, TWSE, TPEX, Bursa, HKEX). Proxied.
+  - name: EGX (Egypt Exchange)
+    description: scanner.tradingview.com-backed, EGX-specific. Proxied.
+  - name: Sentiment & News
+    description: Reddit (unauthenticated, currently 403/dead) + RSS/CNBC. Proxied.
+  - name: Backtesting
+    description: Yahoo Finance OHLC history, pure-Python strategy engine (no scanner dependency). Proxied.
+  - name: Market Data
+    description: Yahoo Finance quotes/options/extended-hours + CoinGecko. Proxied.
+
+components:
+  schemas:
+    ErrorEnvelope:
+      type: object
+      description: Returned instead of data when the upstream scanner is degraded/cliffed.
+      properties:
+        error:
+          oneOf:
+            - type: string
+              description: Simple message from the resilience layer (single-batch tools).
+            - type: object
+              description: Structured envelope from multi-batch tools (e.g. multi_timeframe_analysis).
+              properties:
+                code: { type: string, example: "ALL_BATCHES_FAILED" }
+                message: { type: string }
+                batches_attempted: { type: integer }
+                batches_failed: { type: integer }
+                first_error: { type: string }
+    Indicators:
+      type: object
+      description: Shared indicator block used by several crypto screener tools.
+      properties:
+        open: { type: number, nullable: true }
+        close: { type: number }
+        SMA20: { type: number }
+        BB_upper: { type: number }
+        BB_lower: { type: number }
+        EMA50: { type: number }
+        RSI: { type: number }
+        volume: { type: number }
+
+paths:
+
+  /tools/top_gainers:
+    post:
+      operationId: top_gainers
+      tags: [Crypto Screener]
+      summary: Return top gainers for an exchange and timeframe using Bollinger Band analysis.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                exchange: { type: string, default: KUCOIN, description: "Crypto: KUCOIN, BINANCE, BYBIT, MEXC. Stocks: EGX, BIST, NASDAQ, NYSE, BURSA, HKEX, SSE, SZSE, TWSE, TPEX." }
+                timeframe: { type: string, default: 15m, enum: [5m, 15m, 1h, 4h, 1D, 1W, 1M] }
+                limit: { type: integer, default: 25, description: "Max 50" }
+      responses:
+        "200":
+          description: List of gainer rows, or ErrorEnvelope on total upstream failure.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: array
+                    items:
+                      type: object
+                      properties:
+                        symbol: { type: string, example: "KUCOIN:XPRTUSDT" }
+                        changePercent: { type: number, example: 7.983 }
+                        indicators: { $ref: '#/components/schemas/Indicators' }
+                  - $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                result:
+                  - symbol: "KUCOIN:ACXUSDT"
+                    changePercent: 6.061
+                    indicators: { open: null, close: 0.042, SMA20: 0.0404, BB_upper: 0.0421, BB_lower: 0.0387, EMA50: 0.0403, RSI: 56.09, volume: 984.59 }
+
+  /tools/top_losers:
+    post:
+      operationId: top_losers
+      tags: [Crypto Screener]
+      summary: Return top losers for an exchange and timeframe. Supports crypto (KUCOIN, BINANCE, MEXC) and stocks (EGX, BIST, NASDAQ).
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                exchange: { type: string, default: KUCOIN }
+                timeframe: { type: string, default: 15m, enum: [5m, 15m, 1h, 4h, 1D, 1W, 1M] }
+                limit: { type: integer, default: 25 }
+      responses:
+        "200":
+          description: List of loser rows, or ErrorEnvelope.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: array
+                    items: { type: object, properties: { symbol: { type: string }, changePercent: { type: number }, indicators: { $ref: '#/components/schemas/Indicators' } } }
+                  - $ref: '#/components/schemas/ErrorEnvelope'
+
+  /tools/bollinger_scan:
+    post:
+      operationId: bollinger_scan
+      tags: [Crypto Screener]
+      summary: Scan for assets with low Bollinger Band Width (squeeze detection). Works with crypto and stocks.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                exchange: { type: string, default: KUCOIN }
+                timeframe: { type: string, default: 4h, enum: [5m, 15m, 1h, 4h, 1D, 1W, 1M] }
+                bbw_threshold: { type: number, default: 0.04, description: "Maximum BBW value to filter" }
+                limit: { type: integer, default: 50, description: "Max 100" }
+      responses:
+        "200":
+          description: List of squeeze candidates.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { type: object, properties: { symbol: { type: string }, changePercent: { type: number }, indicators: { $ref: '#/components/schemas/Indicators' } } }
+
+  /tools/rating_filter:
+    post:
+      operationId: rating_filter
+      tags: [Crypto Screener]
+      summary: Filter coins by Bollinger Band rating.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                exchange: { type: string, default: KUCOIN }
+                timeframe: { type: string, default: 5m, enum: [5m, 15m, 1h, 4h, 1D, 1W, 1M] }
+                rating: { type: integer, default: 2, description: "-3=Strong Sell, -2=Sell, -1=Weak Sell, 1=Weak Buy, 2=Buy, 3=Strong Buy" }
+                limit: { type: integer, default: 25, description: "Max 50" }
+      responses:
+        "200":
+          description: List of rows matching the requested rating, or ErrorEnvelope.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: array
+                    items: { type: object }
+                  - $ref: '#/components/schemas/ErrorEnvelope'
+
+  /tools/coin_analysis:
+    post:
+      operationId: coin_analysis
+      tags: [Crypto Screener]
+      summary: Get detailed analysis for a specific asset (coin or stock) on specified exchange and timeframe.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol]
+              properties:
+                symbol: { type: string, description: "Crypto: BTCUSDT, ETHUSDT. Stocks: COMI (EGX), THYAO (BIST), 600519 (SSE), 300251 (SZSE), 2330 (TWSE), 3105 (TPEX)." }
+                exchange: { type: string, default: KUCOIN }
+                timeframe: { type: string, default: 15m, enum: [5m, 15m, 1h, 4h, 1D, 1W, 1M] }
+      responses:
+        "200":
+          description: Full indicator dump — price, RSI, MACD, SMA/EMA ladder, Bollinger Bands, ATR, volume, OBV, support/resistance, stochastic, ADX, market structure, sentiment.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  symbol: { type: string }
+                  exchange: { type: string }
+                  timeframe: { type: string }
+                  price_data: { type: object }
+                  rsi: { type: object }
+                  macd: { type: object }
+                  sma: { type: object }
+                  ema: { type: object }
+                  bollinger_bands: { type: object }
+                  atr: { type: object }
+                  support_resistance: { type: object }
+                  stochastic: { type: object }
+                  adx: { type: object }
+                  market_structure: { type: object }
+                  market_sentiment: { type: object }
+
+  /tools/consecutive_candles_scan:
+    post:
+      operationId: consecutive_candles_scan
+      tags: [Crypto Screener]
+      summary: Scan for coins with consecutive growing/shrinking candles pattern.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                exchange: { type: string, default: KUCOIN }
+                timeframe: { type: string, default: 15m, enum: [5m, 15m, 1h, 4h] }
+                pattern_type: { type: string, default: bullish, enum: [bullish, bearish], description: "bullish = growing candles, bearish = shrinking candles" }
+                candle_count: { type: integer, default: 3, description: "2-5" }
+                min_growth: { type: number, default: 2, description: "Minimum growth % for each candle" }
+                limit: { type: integer, default: 20 }
+      responses:
+        "200":
+          description: Matching symbols with pattern strength and momentum signals.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_found: { type: integer }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        symbol: { type: string }
+                        pattern_strength: { type: integer }
+                        momentum_signals: { type: object }
+
+  /tools/advanced_candle_pattern:
+    post:
+      operationId: advanced_candle_pattern
+      tags: [Crypto Screener]
+      summary: Advanced candle pattern analysis using multi-timeframe data.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                exchange: { type: string, default: KUCOIN }
+                base_timeframe: { type: string, default: 15m, enum: [5m, 15m, 1h, 4h] }
+                pattern_length: { type: integer, default: 3, description: "2-4" }
+                min_size_increase: { type: number, default: 10, description: "Min % increase in candle size" }
+                limit: { type: integer, default: 15 }
+      responses:
+        "200":
+          description: Matching symbols with pattern_score and detail signals.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_found: { type: integer }
+                  data:
+                    type: array
+                    items: { type: object, properties: { symbol: { type: string }, pattern_score: { type: integer }, details: { type: array, items: { type: string } } } }
+
+  /tools/volume_breakout_scanner:
+    post:
+      operationId: volume_breakout_scanner
+      tags: [Crypto Screener]
+      summary: Detect coins with volume breakout + price breakout.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                exchange: { type: string, default: KUCOIN }
+                timeframe: { type: string, default: 15m, enum: [5m, 15m, 1h, 4h, 1D, 1W, 1M] }
+                volume_multiplier: { type: number, default: 2, description: "Volume multiple above normal" }
+                price_change_min: { type: number, default: 3, description: "Minimum price change %" }
+                limit: { type: integer, default: 25, description: "Max 50" }
+      responses:
+        "200":
+          description: List of breakout candidates, or ErrorEnvelope. Empty list strictly means "no matches today" — a rate-limit cliff surfaces as ErrorEnvelope instead.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: array
+                    items: { type: object, properties: { symbol: { type: string }, changePercent: { type: number }, volume_ratio: { type: number }, breakout_type: { type: string, enum: [bullish, bearish] } } }
+                  - $ref: '#/components/schemas/ErrorEnvelope'
+
+  /tools/volume_confirmation_analysis:
+    post:
+      operationId: volume_confirmation_analysis
+      tags: [Crypto Screener]
+      summary: Detailed volume confirmation analysis for a specific coin.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol]
+              properties:
+                symbol: { type: string, example: BTCUSDT, description: "Bare ticker, NOT exchange-qualified — do not pass EXCHANGE:SYMBOL here, that raises a validation error." }
+                exchange: { type: string, default: KUCOIN }
+                timeframe: { type: string, default: 15m }
+      responses:
+        "200":
+          description: Volume-confirmation breakdown, or an error dict if the symbol/exchange pair fails upstream validation.
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /tools/smart_volume_scanner:
+    post:
+      operationId: smart_volume_scanner
+      tags: [Crypto Screener]
+      summary: Smart volume + technical analysis combination scanner.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                exchange: { type: string, default: KUCOIN }
+                min_volume_ratio: { type: number, default: 2 }
+                min_price_change: { type: number, default: 2 }
+                rsi_range: { type: string, default: any, enum: [oversold, overbought, neutral, any], description: "oversold <30, overbought >70, neutral 30-70" }
+                limit: { type: integer, default: 20, description: "Max 30" }
+      responses:
+        "200":
+          description: List with an added trading_recommendation field, or ErrorEnvelope (inherited from the inner volume_breakout_scan call).
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: array
+                    items: { type: object, properties: { symbol: { type: string }, trading_recommendation: { type: string, example: "🚀 STRONG BUY" } } }
+                  - $ref: '#/components/schemas/ErrorEnvelope'
+
+  /tools/multi_agent_analysis:
+    post:
+      operationId: multi_agent_analysis
+      tags: [Crypto Screener]
+      summary: Run a multi-agent debate (Technical, Sentiment, Risk) for a specific symbol.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol]
+              properties:
+                symbol: { type: string, description: "Crypto: BTCUSDT. Stocks: COMI (EGX), THYAO (BIST), 600519 (SSE), 300251 (SZSE), 2330 (TWSE), 3105 (TPEX), GDX (AMEX)." }
+                exchange: { type: string, default: KUCOIN }
+                timeframe: { type: string, default: 15m, enum: [5m, 15m, 1h, 4h, 1D, 1W] }
+      responses:
+        "200":
+          description: A structured 3-agent debate culminating in a final decision.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agents_debate:
+                    type: object
+                    properties:
+                      technical_analyst: { type: object }
+                      sentiment_analyst: { type: object }
+                      risk_manager: { type: object }
+                  consensus:
+                    type: object
+                    properties:
+                      decision: { type: string, example: "STRONG BUY" }
+                      confidence: { type: string, example: High }
+                      net_score: { type: integer }
+
+  /tools/egx_market_overview:
+    post:
+      operationId: egx_market_overview
+      tags: [EGX (Egypt Exchange)]
+      summary: Get a comprehensive overview of the Egyptian Exchange (EGX) market.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                timeframe: { type: string, default: 1D, enum: [5m, 15m, 1h, 4h, 1D, 1W, 1M] }
+                limit: { type: integer, default: 10, description: "Stocks per category, max 20" }
+      responses:
+        "200":
+          description: "top_gainers/top_losers/most_active + market breadth stats, or {error: \"No data returned for EGX stocks\"} — was seen as a false-empty symptom of the pre-fix unproxied scanner cliff (2026-08-16); confirm real EGX data returns before treating an empty response as authoritative off-hours behavior."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_analyzed: { type: integer }
+                  top_gainers: { type: array, items: { type: object } }
+                  top_losers: { type: array, items: { type: object } }
+                  most_active: { type: array, items: { type: object } }
+                  market_stats: { type: object, properties: { advancing: { type: integer }, declining: { type: integer }, unchanged: { type: integer }, avg_change: { type: number } } }
+
+  /tools/egx_sector_scan:
+    post:
+      operationId: egx_sector_scan
+      tags: [EGX (Egypt Exchange)]
+      summary: Scan EGX stocks by sector. Shows available sectors if none specified.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                sector: { type: string, default: "", description: "banks, healthcare_and_pharma, real_estate, etc. Empty = list all sectors instead of scanning." }
+                timeframe: { type: string, default: 1D, enum: [5m, 15m, 1h, 4h, 1D, 1W, 1M] }
+                limit: { type: integer, default: 20, description: "Max 50" }
+      responses:
+        "200":
+          description: Either a sector scan result, or (if sector omitted) the available_sectors list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  available_sectors: { type: array, items: { type: string } }
+                  usage: { type: string }
+
+  /tools/egx_sector_scanner:
+    post:
+      operationId: egx_sector_scanner
+      tags: [EGX (Egypt Exchange)]
+      summary: Sector rotation scanner for EGX — identifies hot/cold sectors and top picks.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                timeframe: { type: string, default: 1D, enum: [5m, 15m, 1h, 4h, 1D, 1W, 1M] }
+                top_n_sectors: { type: integer, default: 5, description: "1-18" }
+                top_n_stocks: { type: integer, default: 3, description: "Per highlighted sector, 1-10" }
+                min_stock_score: { type: integer, default: 60, description: "0-100" }
+      responses:
+        "200":
+          description: Weighted market view, per-sector heatmap (momentum/breadth/volume flow), top picks per hot sector, rotation_signals summary.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  weighted_market_view: { type: object }
+                  sector_heatmap: { type: array, items: { type: object } }
+                  sector_top_picks: { type: object }
+                  rotation_signals: { type: array, items: { type: string } }
+
+  /tools/egx_index_analysis:
+    post:
+      operationId: egx_index_analysis
+      tags: [EGX (Egypt Exchange)]
+      summary: Analyse an EGX index showing constituent performance with full indicators.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                index: { type: string, default: EGX30, enum: [EGX30, EGX70, EGX100, SHARIAH33, EGX35LV, TAMAYUZ] }
+                timeframe: { type: string, default: 1D, enum: [5m, 15m, 1h, 4h, 1D, 1W, 1M] }
+                limit: { type: integer, default: 30, description: "Max 100" }
+      responses:
+        "200":
+          description: Index stats, sector breakdown, top gainers/losers among constituents, full constituent list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  index_stats: { type: object }
+                  sector_breakdown: { type: array, items: { type: object } }
+                  top_gainers: { type: array, items: { type: object } }
+                  top_losers: { type: array, items: { type: object } }
+                  all_stocks: { type: array, items: { type: object } }
+
+  /tools/egx_stock_screener:
+    post:
+      operationId: egx_stock_screener
+      tags: [EGX (Egypt Exchange)]
+      summary: Production stock ranking engine for EGX — finds strong stocks with actionable setups.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                timeframe: { type: string, default: 1D, enum: [5m, 15m, 1h, 4h, 1D, 1W, 1M] }
+                min_score: { type: integer, default: 55, description: "0-100" }
+                index_filter: { type: string, default: "", enum: ["", EGX30, EGX70, EGX100, SHARIAH33, EGX35LV, TAMAYUZ] }
+                limit: { type: integer, default: 20, description: "Max 50" }
+      responses:
+        "200":
+          description: Graded watchlist (Strong / Watchlist / Avoid) with per-stock score_breakdown and qualified_trades meeting the execution_rules threshold.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_scanned: { type: integer }
+                  total_passed: { type: integer }
+                  grade_distribution: { type: object }
+                  qualified_trades: { type: array, items: { type: object } }
+                  watchlist: { type: array, items: { type: object } }
+                  execution_rules: { type: object }
+
+  /tools/egx_trade_plan:
+    post:
+      operationId: egx_trade_plan
+      tags: [EGX (Egypt Exchange)]
+      summary: Generate a full trade plan for a specific EGX stock.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol]
+              properties:
+                symbol: { type: string, example: COMI, description: "e.g. COMI, TMGH, FWRY" }
+                timeframe: { type: string, default: 1D, enum: [5m, 15m, 1h, 4h, 1D, 1W, 1M] }
+      responses:
+        "200":
+          description: Score, grade, full indicator set, trade_setup (entries/stop/targets/R:R), trade_quality_score, and a plain-language recommendation.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stock_score: { type: integer }
+                  grade: { type: string, enum: [Strong, Watchlist, Avoid] }
+                  trade_setup: { type: object }
+                  trade_quality_score: { type: integer }
+                  trade_quality: { type: string }
+                  recommendation: { type: string }
+
+  /tools/egx_fibonacci_retracement:
+    post:
+      operationId: egx_fibonacci_retracement
+      tags: [EGX (Egypt Exchange)]
+      summary: Fibonacci retracement analysis for EGX stocks.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol]
+              properties:
+                symbol: { type: string, example: COMI }
+                lookback: { type: string, default: 52W, enum: [1M, 3M, 6M, 52W, ALL] }
+                timeframe: { type: string, default: 1D, enum: [5m, 15m, 1h, 4h, 1D, 1W, 1M] }
+      responses:
+        "200":
+          description: Swing high/low, retracement + extension levels, current price position within the fib zone, plain-language interpretation.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  swing_high: { type: number }
+                  swing_low: { type: number }
+                  retracement_levels: { type: object }
+                  extension_levels: { type: object }
+                  price_position: { type: object }
+                  interpretation: { type: string }
+
+  /tools/multi_timeframe_analysis:
+    post:
+      operationId: multi_timeframe_analysis
+      tags: [Crypto Screener]
+      summary: "Multi-timeframe alignment analysis (Weekly → Daily → 4H → 1H → 15m)."
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol]
+              properties:
+                symbol: { type: string, description: "Crypto: BTCUSDT. Stocks: COMI (EGX), THYAO (BIST), 600519 (SSE), 300251 (SZSE), 2330 (TWSE), 3105 (TPEX), GDX (AMEX)." }
+                exchange: { type: string, default: KUCOIN, enum: [KUCOIN, BINANCE, MEXC, EGX, BIST, NASDAQ, NYSE, AMEX, NYSEARCA, PCX, SSE, SZSE, TWSE, TPEX] }
+      responses:
+        "200":
+          description: One block per timeframe (1W/1D/4h/1h/15m) with bias + reasons, plus an overall alignment verdict. Returns ErrorEnvelope (code ALL_BATCHES_FAILED) only if all 5 timeframe batches fail.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    properties:
+                      timeframes: { type: object }
+                      alignment: { type: object, properties: { status: { type: string, example: "LEAN BEARISH" }, confidence: { type: string }, net_score: { type: integer }, divergent_timeframes: { type: array, items: { type: string } } } }
+                      recommendation: { type: object }
+                  - $ref: '#/components/schemas/ErrorEnvelope'
+
+  /tools/market_sentiment:
+    post:
+      operationId: market_sentiment
+      tags: [Sentiment & News]
+      summary: Real-time Reddit sentiment analysis for stocks and crypto.
+      description: |
+        **Known limitation, not a bug in this server:** Reddit blocks unauthenticated
+        JSON requests from this host with HTTP 403, silently swallowed to a fake
+        neutral/zero result. `posts_analyzed` will read `0` on every call regardless
+        of proxy status — confirmed live both before and after the 2026-08-16 proxy
+        fix (sentiment_service.py was already proxied). Not fixable without a
+        Reddit-authenticated (OAuth) client, which is out of scope for this server.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol]
+              properties:
+                symbol: { type: string, example: AAPL }
+                category: { type: string, default: all, enum: [crypto, stocks, all] }
+                limit: { type: integer, default: 20 }
+      responses:
+        "200":
+          description: Always returns a well-formed sentiment object; posts_analyzed is currently always 0 (see description).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sentiment_score: { type: number, example: 0.0 }
+                  sentiment_label: { type: string, example: Neutral }
+                  posts_analyzed: { type: integer, example: 0 }
+                  sources: { type: array, items: { type: string } }
+
+  /tools/financial_news:
+    post:
+      operationId: financial_news
+      tags: [Sentiment & News]
+      summary: "Real-time financial news from RSS feeds (Reuters, CoinDesk, etc.)"
+      description: |
+        Sources: crypto = CoinDesk + CoinTelegraph; stocks = Yahoo Finance +
+        MarketWatch (Top + Real-Time) + CNBC Top News; all = combined. Original
+        Reuters RSS feeds are deprecated since ~2020 and were replaced.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                symbol: { type: string, nullable: true, default: null, description: "Optional ticker filter, e.g. AAPL, BTC. null = all news." }
+                category: { type: string, default: stocks, enum: [crypto, stocks, all] }
+                limit: { type: integer, default: 10 }
+      responses:
+        "200":
+          description: List of news items with title/url/published/summary/source.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count: { type: integer }
+                  feedparser_available: { type: boolean }
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        title: { type: string }
+                        url: { type: string }
+                        published: { type: string }
+                        summary: { type: string }
+                        source: { type: string }
+
+  /tools/combined_analysis:
+    post:
+      operationId: combined_analysis
+      tags: [Sentiment & News]
+      summary: "POWER TOOL: TradingView technical analysis + Reddit sentiment + Financial news."
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol]
+              properties:
+                symbol: { type: string, example: AAPL }
+                exchange: { type: string, default: NASDAQ, enum: [NASDAQ, NYSE, AMEX, NYSEARCA, PCX, BINANCE, KUCOIN, MEXC, BIST, EGX, TWSE, TPEX] }
+                timeframe: { type: string, default: 1D, enum: [5m, 15m, 1h, 4h, 1D, 1W] }
+      responses:
+        "200":
+          description: technical/sentiment/news sections, each independently fail-soft (a scanner outage degrades only `technical.error`, never the whole response), plus a confluence verdict.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  technical: { type: object, description: "Same shape as coin_analysis, or {error, symbol, exchange, timeframe} on scanner failure." }
+                  sentiment: { type: object }
+                  news: { type: object, properties: { count: { type: integer }, latest: { type: array, items: { type: object } } } }
+                  confluence: { type: object, properties: { signals_agree: { type: boolean }, confidence: { type: string }, recommendation: { type: string } } }
+
+  /tools/backtest_strategy:
+    post:
+      operationId: backtest_strategy
+      tags: [Backtesting]
+      summary: Backtest a trading strategy on historical data with institutional-grade metrics.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol, strategy]
+              properties:
+                symbol: { type: string, example: AAPL, description: "Yahoo Finance symbol (AAPL, BTC-USD, THYAO.IS, ^GSPC)" }
+                strategy: { type: string, enum: [rsi, bollinger, macd, ema_cross, supertrend, donchian, rsi_pullback, keltner_breakout, triple_ema], description: "rsi_pullback and triple_ema need period >= 1y for SMA200 warmup." }
+                period: { type: string, default: 1y, enum: [1mo, 3mo, 6mo, 1y, 2y] }
+                initial_capital: { type: number, default: 10000 }
+                commission_pct: { type: number, default: 0.1 }
+                slippage_pct: { type: number, default: 0.05 }
+                interval: { type: string, default: 1d, enum: [1d, 1h] }
+                include_trade_log: { type: boolean, default: false }
+                include_equity_curve: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Full backtest report — returns, win rate, drawdown, Sharpe/Calmar, best/worst trade, vs. buy-and-hold.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_trades: { type: integer }
+                  win_rate_pct: { type: number }
+                  total_return_pct: { type: number }
+                  max_drawdown_pct: { type: number }
+                  sharpe_ratio: { type: number }
+                  buy_and_hold_return_pct: { type: number }
+                  recent_trades: { type: array, items: { type: object } }
+
+  /tools/compare_strategies:
+    post:
+      operationId: compare_strategies
+      tags: [Backtesting]
+      summary: "Run all 9 strategies (RSI, Bollinger, MACD, EMA Cross, Supertrend, Donchian, RSI Pullback, Keltner Breakout, Triple EMA) and return a ranked leaderboard."
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol]
+              properties:
+                symbol: { type: string, example: AAPL, description: "Yahoo Finance symbol (AAPL, BTC-USD, SPY...)" }
+                period: { type: string, default: 1y, enum: [1mo, 3mo, 6mo, 1y, 2y], description: ">=1y recommended so rsi_pullback/triple_ema aren't zero-trade" }
+                initial_capital: { type: number, default: 10000 }
+                interval: { type: string, default: 1d, enum: [1d, 1h] }
+      responses:
+        "200":
+          description: Ranked leaderboard across all 9 strategies vs. buy-and-hold, plus a warnings string for strategies needing longer warmup.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  winner: { type: string }
+                  ranking: { type: array, items: { type: object } }
+                  warnings: { type: string }
+
+  /tools/walk_forward_backtest_strategy:
+    post:
+      operationId: walk_forward_backtest_strategy
+      tags: [Backtesting]
+      summary: Walk-forward backtest to detect overfitting — validates strategy on unseen data.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol, strategy]
+              properties:
+                symbol: { type: string, example: AAPL }
+                strategy: { type: string, enum: [rsi, bollinger, macd, ema_cross, supertrend, donchian, keltner_breakout], description: "rsi_pullback/triple_ema NOT supported here — SMA200 warmup exceeds typical fold size." }
+                period: { type: string, default: 2y, enum: [1mo, 3mo, 6mo, 1y, 2y] }
+                initial_capital: { type: number, default: 10000 }
+                commission_pct: { type: number, default: 0.1 }
+                slippage_pct: { type: number, default: 0.05 }
+                n_splits: { type: integer, default: 3, description: "Max 10" }
+                train_ratio: { type: number, default: 0.7 }
+                interval: { type: string, default: 1d, enum: [1d, 1h] }
+      responses:
+        "200":
+          description: Per-fold train/test returns, out-of-sample aggregate stats, a robustness_score, and a plain-language overfitting verdict.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  robustness_score: { type: number }
+                  verdict: { type: string, example: "WEAK — significant out-of-sample degradation, likely overfitted" }
+                  oos_total_return_pct: { type: number }
+                  folds: { type: array, items: { type: object } }
+
+  /tools/yahoo_price:
+    post:
+      operationId: yahoo_price
+      tags: [Market Data]
+      summary: Real-time price quote from Yahoo Finance for any stock, crypto, ETF or index.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol]
+              properties:
+                symbol: { type: string, example: AAPL, description: "AAPL, BTC-USD, SPY, ^GSPC, EURUSD=X, THYAO.IS" }
+      responses:
+        "200":
+          description: Current price, previous close, change, 52-week range.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  price: { type: number }
+                  previous_close: { type: number }
+                  change_pct: { type: number }
+                  52w_high: { type: number }
+                  52w_low: { type: number }
+                  source: { type: string, example: "Yahoo Finance" }
+
+  /tools/market_snapshot:
+    post:
+      operationId: market_snapshot
+      tags: [Market Data]
+      summary: "Global market overview: major indices, top crypto, FX rates, and key ETFs. Powered by Yahoo Finance."
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: {} }
+      responses:
+        "200":
+          description: Fixed watchlist snapshot — no parameters.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  indices: { type: array, items: { type: object } }
+                  crypto: { type: array, items: { type: object } }
+                  fx: { type: array, items: { type: object } }
+                  etfs: { type: array, items: { type: object } }
+
+  /tools/bitcoin_market_pulse:
+    post:
+      operationId: bitcoin_market_pulse
+      tags: [Market Data]
+      summary: "Single-call BTC macro context: price, dominance, total market cap + risk assessment."
+      description: |
+        Use whenever analyzing any cryptocurrency (BTC or an altcoin) to get the
+        broader macro frame in one shot — an alt setup reads very differently when
+        BTC is dumping with rising dominance vs. alts leading. Source: CoinGecko
+        public API, no key required.
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: {} }
+      responses:
+        "200":
+          description: No parameters.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  bitcoin: { type: object }
+                  dominance: { type: object, properties: { btc_pct: { type: number }, eth_pct: { type: number } } }
+                  total_market: { type: object }
+                  assessment: { type: object, properties: { label: { type: string, enum: [HIGH_RISK, ALT_RISK, ALT_FAVORABLE, OPPORTUNITY_WITH_CAUTION, NEUTRAL] }, summary: { type: string } } }
+
+  /tools/stock_extended_hours:
+    post:
+      operationId: stock_extended_hours
+      tags: [Market Data]
+      summary: Real-time pre-market and after-hours prices for a US stock symbol.
+      description: |
+        Use for questions outside the regular 9:30am-4pm ET session — earnings
+        reactions, overnight news, "what is X doing in after-hours?". During the
+        regular session, post_market is null (no data yet). On weekends/holidays,
+        returns whatever's most recent in each window.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol]
+              properties:
+                symbol: { type: string, example: AAPL, description: "US stock symbol — AAPL, NVDA, TSLA, SPY, ^GSPC" }
+      responses:
+        "200":
+          description: pre_market / regular / post_market blocks, each nullable, plus previous_close and market_state.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pre_market: { type: object, nullable: true }
+                  regular: { type: object, nullable: true }
+                  post_market: { type: object, nullable: true }
+                  previous_close: { type: number }
+                  market_state: { type: string, nullable: true }
+                  source: { type: string, example: "Yahoo Finance" }
+
+  /tools/stock_options_chain:
+    post:
+      operationId: stock_options_chain
+      tags: [Market Data]
+      summary: Full options chain (calls + puts) for a US stock symbol and one expiry.
+      description: If `expiry` is omitted, returns the nearest expiry along with `available_expiries` so the caller can quote it back and ask "want a different one?".
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol]
+              properties:
+                symbol: { type: string, example: AAPL }
+                expiry: { type: string, nullable: true, default: null, format: date, description: "YYYY-MM-DD. Must match one of the returned available_expiries; otherwise returns an error with the valid list." }
+      responses:
+        "200":
+          description: Underlying price + full calls/puts arrays (strike, last, bid, ask, volume, OI, IV, ITM, expiration).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  underlying_price: { type: number }
+                  requested_expiry: { type: string }
+                  available_expiries: { type: array, items: { type: string, format: date } }
+                  call_count: { type: integer }
+                  put_count: { type: integer }
+                  calls: { type: array, items: { type: object } }
+                  puts: { type: array, items: { type: object } }
+                  source: { type: string, example: "Yahoo Finance" }
+
+  /tools/stock_options_unusual_activity:
+    post:
+      operationId: stock_options_unusual_activity
+      tags: [Market Data]
+      summary: Top strikes by volume / open-interest ratio — institutional positioning signal.
+      description: |
+        A V/OI ratio > 1 means today's volume already exceeds standing open
+        interest — a classic signal of fresh institutional positioning on a
+        specific strike/direction. Scans the soonest few expirations, filters
+        illiquid strikes below min_volume, returns top-N by V/OI descending.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol]
+              properties:
+                symbol: { type: string, example: AAPL }
+                top_n: { type: integer, default: 10 }
+                min_volume: { type: integer, default: 100, description: "Filter floor for today's volume" }
+                expiries: { type: integer, default: 4, description: "Soonest expirations to scan (~1mo of weeklies+monthlies)" }
+      responses:
+        "200":
+          description: Aggregate call/put volume + ratio, plus top-N unusual contracts.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  underlying_price: { type: number }
+                  expiries_scanned: { type: array, items: { type: string, format: date } }
+                  total_call_volume: { type: integer }
+                  total_put_volume: { type: integer }
+                  put_call_volume_ratio: { type: number }
+                  unusual:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        contract_symbol: { type: string }
+                        side: { type: string, enum: [call, put] }
+                        strike: { type: number }
+                        expiration: { type: string, format: date }
+                        volume: { type: integer }
+                        open_interest: { type: integer }
+                        v_oi_ratio: { type: number }
+                        implied_volatility: { type: number }
+                        strike_vs_spot_pct: { type: number }
