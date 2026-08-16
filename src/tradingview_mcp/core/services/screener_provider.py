@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import List, Dict, Any, Optional, Tuple
 from ..utils.validators import get_market_type
+from .proxy_manager import get_proxy
 import json as _json
 import os as _os
 import random as _random
@@ -330,7 +331,7 @@ def _scan_with_retry(q, cookies=None, cache_key: Optional[Tuple] = None):
             _time.sleep(wait)
             total_wait += wait
         try:
-            return q.get_scanner_data(cookies=cookies)
+            return q.get_scanner_data(cookies=cookies, proxies=get_proxy())
         except Exception as e:  # noqa: BLE001 - intentionally broad, narrowed below
             if not _is_transient_screener_error(e):
                 raise
@@ -402,6 +403,7 @@ def resilient_get_multiple_analysis(screener, interval, symbols):
                     interval=interval,
                     symbols=symbols,
                     timeout=_socket_timeout_s(),
+                    proxies=get_proxy(),
                 )
             finally:
                 _ta_throttle_release()
@@ -504,7 +506,7 @@ def fetch_atr_for_tickers(
         "columns": [col],
     }
     try:
-        resp = requests.post(url, json=payload, timeout=timeout)
+        resp = requests.post(url, json=payload, timeout=timeout, proxies=get_proxy())
         resp.raise_for_status()
         body = resp.json()
     except Exception:  # noqa: BLE001 — graceful degrade

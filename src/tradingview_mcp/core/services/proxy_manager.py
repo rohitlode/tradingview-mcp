@@ -90,19 +90,15 @@ def get_proxy() -> Optional[dict]:
     return {"http": url, "https": url}
 
 
-def build_opener_with_proxy(
-    user_agent: str = "tradingview-mcp/0.5.0",
-) -> urllib.request.OpenerDirector:
-    """
-    Build a urllib OpenerDirector with proxy if configured, plain opener otherwise.
-    Services degrade gracefully when no proxy is set — no crashes.
-    """
-    opener = urllib.request.build_opener()
-    opener.addheaders = [("User-Agent", user_agent)]
+def get_proxy_handlers() -> list:
+    """Return urllib handlers (ProxyHandler + Basic-Auth) for the configured
+    proxy, for callers that build their own opener (e.g. options_service's
+    cookie-jar opener) or pass ``handlers=`` to a library (e.g. feedparser).
 
+    Returns ``[]`` if not configured — callers degrade to a direct request.
+    """
     if not is_proxy_configured():
-        return opener
-
+        return []
     proxy_url = get_proxy_url()
     c = _cfg()
     # Extract username from the full url for auth handler
@@ -112,8 +108,17 @@ def build_opener_with_proxy(
     pwd_mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
     pwd_mgr.add_password(None, f"http://{c['host']}:{c['port']}", username, c["password"])
     auth_handler = urllib.request.ProxyBasicAuthHandler(pwd_mgr)
+    return [proxy_handler, auth_handler]
 
-    opener = urllib.request.build_opener(proxy_handler, auth_handler)
+
+def build_opener_with_proxy(
+    user_agent: str = "tradingview-mcp/0.5.0",
+) -> urllib.request.OpenerDirector:
+    """
+    Build a urllib OpenerDirector with proxy if configured, plain opener otherwise.
+    Services degrade gracefully when no proxy is set — no crashes.
+    """
+    opener = urllib.request.build_opener(*get_proxy_handlers())
     opener.addheaders = [("User-Agent", user_agent)]
     return opener
 

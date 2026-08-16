@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **Webshare proxy was only wired to 3 of 9 upstream-calling services** —
+  `yahoo_finance_service.py`, `sentiment_service.py`, and (partially,
+  direct-first-then-proxy-fallback) `backtest_service.py` used it;
+  `screener_provider.py` (the module every scanner-backed tool routes
+  through — 20 of the 30 MCP tools, including all EGX tools and every
+  crypto screener), `options_service.py`, `extended_hours_service.py`,
+  `bitcoin_market_service.py`, and `news_service.py` all hit their
+  upstream directly off the host's own IP. Confirmed live: a sequential
+  single-tool-at-a-time test cliffed the unproxied scanner path after
+  ~16 calls with a hard `scanner.tradingview.com` empty-body failure that
+  did not clear even 90+ seconds later — while every proxied/Yahoo/
+  CoinGecko/RSS call kept succeeding throughout, proving the failure was
+  scoped to that one unproxied egress. Every upstream-calling service now
+  routes through the proxy when configured (`PROXY_ENABLED=true`):
+  `screener_provider.py`'s `_scan_with_retry`/`resilient_get_multiple_analysis`/
+  `fetch_atr_for_tickers` now pass `proxies=get_proxy()`;
+  `options_service.py`'s cookie-jar opener and `feedparser.parse()` calls
+  in `news_service.py` now include the new `proxy_manager.get_proxy_handlers()`;
+  `extended_hours_service.py` and `bitcoin_market_service.py` now build
+  their request via `build_opener_with_proxy()` instead of raw
+  `urllib.request.urlopen()`; `backtest_service.py`'s direct-first
+  fallback-to-proxy pattern was simplified to always use the proxy,
+  matching every other service. Degrades gracefully to a direct request
+  when `PROXY_ENABLED=false` or credentials are unset — unchanged for
+  users running without a proxy.
 - **`coin_analysis` ATR null bug**: `tradingview_ta` omits the `ATR` column from
   its analysis payload, which left `indicators["ATR"]` (and every downstream
   consumer — stop-loss sizing, trade-quality score, volatility metrics) at

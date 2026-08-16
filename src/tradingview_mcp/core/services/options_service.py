@@ -38,6 +38,8 @@ import urllib.request
 import urllib.error
 from typing import Optional, List, Dict, Any
 
+from tradingview_mcp.core.services.proxy_manager import get_proxy_handlers
+
 _TIMEOUT = 12
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -60,7 +62,9 @@ def _new_session_opener() -> urllib.request.OpenerDirector:
     Yahoo's anti-bot blocks plain `python-urllib/x.y` so we present as Chrome.
     """
     cj = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(cj), *get_proxy_handlers()
+    )
     opener.addheaders = [
         ("User-Agent", _UA),
         ("Accept", "application/json, text/plain, */*"),

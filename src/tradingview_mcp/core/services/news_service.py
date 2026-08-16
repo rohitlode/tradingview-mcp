@@ -26,6 +26,8 @@ try:
 except ImportError:
     _FEEDPARSER_AVAILABLE = False
 
+from tradingview_mcp.core.services.proxy_manager import get_proxy_handlers
+
 # ─── Feed Catalog ─────────────────────────────────────────────────────────────
 
 RSS_FEEDS: dict[str, list[dict]] = {
@@ -86,7 +88,9 @@ def fetch_news(
         if len(results) >= limit:
             break
         try:
-            feed = feedparser.parse(feed_info["url"], agent=_FEED_USER_AGENT)
+            feed = feedparser.parse(
+                feed_info["url"], agent=_FEED_USER_AGENT, handlers=get_proxy_handlers()
+            )
             source_name = feed.feed.get("title", feed_info["name"])
 
             for entry in feed.entries:

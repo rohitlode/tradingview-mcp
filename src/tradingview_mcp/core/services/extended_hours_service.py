@@ -29,6 +29,8 @@ import urllib.request
 import urllib.error
 from typing import Optional
 
+from tradingview_mcp.core.services.proxy_manager import build_opener_with_proxy
+
 _TIMEOUT = 12
 _UA = "tradingview-mcp/0.8.1"
 _BASE = "https://query1.finance.yahoo.com/v8/finance/chart"
@@ -62,7 +64,7 @@ def get_extended_hours_price(symbol: str) -> dict:
         url, headers={"User-Agent": _UA, "Accept": "application/json"}
     )
     try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+        with build_opener_with_proxy(_UA).open(req, timeout=_TIMEOUT) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, json.JSONDecodeError) as e:
         return {"symbol": symbol.upper(), "error": f"{type(e).__name__}: {e}"}
