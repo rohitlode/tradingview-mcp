@@ -571,7 +571,12 @@ async def get_cached_analysis(
             INVALID_PARAMETER error envelope — call that tool directly.
         symbol: Symbol, same form the underlying tool accepts ("AAPL", "BTCUSDT").
         exchange: Exchange, same form the underlying tool accepts. Default NASDAQ.
-        ttl_s: How fresh a cached result must be to count as a hit. Default 120.
+        ttl_s: How fresh a cached result must be to count as a hit, in seconds.
+            Default 120. This is YOUR freshness requirement and is honoured
+            strictly — a result older than `ttl_s` is never returned as
+            "fresh", whatever TTL the writer used. Upstream failures are
+            cached far more briefly (~15s) so a transient blip does not
+            blank a symbol for the full window.
 
     Returns:
         {"status": "fresh", "tool", "args", "result": {...}} or

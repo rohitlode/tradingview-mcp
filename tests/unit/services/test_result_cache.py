@@ -72,6 +72,65 @@ class TestResultCache:
 
         assert cache.get("t", {"symbol": "AAPL"}) == {"v": 1}
 
+    def test_requested_ttl_stricter_than_stored_ttl_wins(self, cache):
+        """A caller asking for a 30s window must NOT be handed a 60s-old row
+        just because the writer stored it under a 3600s TTL."""
+        cache.put("t", {"symbol": "AAPL"}, {"v": 1}, ttl_s=3600.0)
+        key = cache_key_for("t", {"symbol": "AAPL"})
+        with sqlite3.connect(str(cache.db_path)) as conn:
+            conn.execute(
+                "UPDATE tool_result_cache SET computed_at = computed_at - 60 WHERE cache_key = ?",
+                (key,),
+            )
+
+        assert cache.get("t", {"symbol": "AAPL"}, ttl_s=30.0) is None
+        # ...and the same row is still fresh for a caller that asked for more.
+        assert cache.get("t", {"symbol": "AAPL"}, ttl_s=300.0) == {"v": 1}
+
+    def test_stored_ttl_stricter_than_requested_ttl_wins(self, cache):
+        """The reverse direction: a short-lived (e.g. negatively cached) row is
+        not resurrected by a caller asking for a long window."""
+        cache.put("t", {"symbol": "AAPL"}, {"v": 1}, ttl_s=15.0)
+        key = cache_key_for("t", {"symbol": "AAPL"})
+        with sqlite3.connect(str(cache.db_path)) as conn:
+            conn.execute(
+                "UPDATE tool_result_cache SET computed_at = computed_at - 60 WHERE cache_key = ?",
+                (key,),
+            )
+
+        assert cache.get("t", {"symbol": "AAPL"}, ttl_s=3600.0) is None
+
+    def test_omitting_ttl_falls_back_to_the_stored_ttl(self, cache):
+        cache.put("t", {"symbol": "AAPL"}, {"v": 1}, ttl_s=3600.0)
+        key = cache_key_for("t", {"symbol": "AAPL"})
+        with sqlite3.connect(str(cache.db_path)) as conn:
+            conn.execute(
+                "UPDATE tool_result_cache SET computed_at = computed_at - 600 WHERE cache_key = ?",
+                (key,),
+            )
+
+        assert cache.get("t", {"symbol": "AAPL"}) == {"v": 1}
+
+    def test_unusable_requested_ttl_falls_back_to_stored(self, cache):
+        cache.put("t", {"symbol": "AAPL"}, {"v": 1}, ttl_s=3600.0)
+        assert cache.get("t", {"symbol": "AAPL"}, ttl_s="not-a-number") == {"v": 1}
+
+    def test_purge_expired_removes_only_dead_rows(self, cache):
+        cache.put("t", {"symbol": "OLD"}, {"v": 1}, ttl_s=10.0)
+        cache.put("t", {"symbol": "NEW"}, {"v": 2}, ttl_s=3600.0)
+        with sqlite3.connect(str(cache.db_path)) as conn:
+            conn.execute(
+                "UPDATE tool_result_cache SET computed_at = computed_at - 600 "
+                "WHERE cache_key = ?",
+                (cache_key_for("t", {"symbol": "OLD"}),),
+            )
+
+        removed = cache.purge_expired()
+
+        assert removed == 1
+        assert cache.get("t", {"symbol": "OLD"}) is None
+        assert cache.get("t", {"symbol": "NEW"}) == {"v": 2}
+
     def test_put_overwrites_same_key(self, cache):
         cache.put("t", {"symbol": "AAPL"}, {"v": 1}, ttl_s=120.0)
         cache.put("t", {"symbol": "AAPL"}, {"v": 2}, ttl_s=120.0)

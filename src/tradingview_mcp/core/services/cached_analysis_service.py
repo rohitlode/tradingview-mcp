@@ -104,7 +104,12 @@ async def get_pool() -> WorkerPool:
     if _pool is not None and _pool_loop is loop and _pool.running:
         return _pool
 
-    _pool = WorkerPool(cache=ResultCache(), runners=TOOL_RUNNERS)
+    cache = ResultCache()
+    # Housekeeping: drop rows that can never be served again. Once per pool
+    # build (i.e. effectively once per process), off-loop, best-effort.
+    await asyncio.to_thread(cache.purge_expired)
+
+    _pool = WorkerPool(cache=cache, runners=TOOL_RUNNERS)
     _pool_loop = loop
     await _pool.start()
     return _pool
@@ -164,7 +169,9 @@ async def serve_cached_analysis(
     active = pool if pool is not None else await get_pool()
 
     # sqlite read is blocking IO; keep it off the loop like every other IO here.
-    cached = await asyncio.to_thread(active.cache.get, tool, args)
+    # The caller's ttl is passed in: a hit must satisfy THIS caller's freshness
+    # requirement, not merely whatever window the writer happened to use.
+    cached = await asyncio.to_thread(active.cache.get, tool, args, ttl)
     if cached is not None:
         return {"status": "fresh", "tool": tool, "args": args, "result": cached}
 

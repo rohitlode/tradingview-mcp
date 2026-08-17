@@ -26,9 +26,12 @@ Design notes
 * **Never raises.** A cache is an optimisation. A locked DB, a corrupt row, or
   a read-only filesystem degrades to "miss" (or a dropped write) and the caller
   falls back to a real fetch — it must never take down a tool call.
-* **TTL travels with the row.** ``ttl_s`` is stored per entry rather than being
-  a global setting, so different callers can ask for different freshness
-  windows against the same table without invalidating each other.
+* **Freshness is the STRICTER of the two TTLs.** ``ttl_s`` is stored per entry
+  (the window the writer computed it under), and ``get()`` accepts the
+  requester's own ``ttl_s``. An entry counts as fresh only while it satisfies
+  ``min(requested, stored)``. A caller asking for a 5-second window is never
+  handed a 100-second-old row just because some earlier writer used a long TTL
+  — the caller's freshness requirement is a floor on correctness, not a hint.
 
 Environment
 -----------
@@ -139,8 +142,23 @@ class ResultCache:
 
     # ── public API ─────────────────────────────────────────────────────────
 
-    def get(self, tool: str, args: dict[str, Any]) -> Optional[dict[str, Any]]:
-        """Return the cached result, or ``None`` if missing, expired or unreadable."""
+    def get(
+        self,
+        tool: str,
+        args: dict[str, Any],
+        ttl_s: Optional[float] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Return the cached result, or ``None`` if missing, expired or unreadable.
+
+        Args:
+            tool / args: identify the entry.
+            ttl_s: the CALLER's freshness requirement. The entry is considered
+                fresh only while it is within ``min(ttl_s, stored_ttl_s)``, so a
+                caller demanding fresher data than the writer asked for is never
+                served a stale row labelled fresh. ``None`` means "trust the
+                stored TTL", which is only appropriate for callers that have no
+                freshness requirement of their own.
+        """
         key = cache_key_for(tool, args)
         try:
             with self._connect() as conn:
@@ -156,8 +174,14 @@ class ResultCache:
         if row is None:
             return None
 
-        result_json, computed_at, ttl_s = row
-        if (time.time() - float(computed_at)) > float(ttl_s):
+        result_json, computed_at, stored_ttl_s = row
+        effective_ttl = float(stored_ttl_s)
+        if ttl_s is not None:
+            try:
+                effective_ttl = min(effective_ttl, max(0.0, float(ttl_s)))
+            except (TypeError, ValueError):
+                pass  # Unusable requested TTL -> fall back to the stored one.
+        if (time.time() - float(computed_at)) > effective_ttl:
             return None
 
         try:

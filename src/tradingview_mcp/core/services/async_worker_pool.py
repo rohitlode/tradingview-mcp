@@ -40,11 +40,24 @@ its response cache, a ``threading.Semaphore`` bounding in-flight upstream
 calls, a lock around its min-interval pacing) — it is designed to be called
 from several threads at once.
 
+Negative caching
+----------------
+A result that is a structured error envelope (``{"error": {...}}`` — e.g.
+``ALL_BATCHES_FAILED`` from a transient upstream blip) is cached under a SHORT,
+separate TTL rather than the caller's success TTL. Caching an error for the
+full success window (120s by default) would degrade-block a symbol for two
+minutes over a fault that often clears in seconds; caching it for a few seconds
+still stops a polling caller from re-hammering a struggling upstream. The
+default reuses the provider layer's own post-failure cooldown
+(``TRADINGVIEW_MCP_FAILURE_COOLDOWN_S``, 15s) — the same "give upstream room to
+recover" number, deliberately not a second invented constant.
+
 Environment
 -----------
-``TRADINGVIEW_MCP_CACHE_WORKERS``  Worker count. Default 2, matching the
-                                   existing ``TRADINGVIEW_MCP_MAX_INFLIGHT``
-                                   precedent for upstream concurrency.
+``TRADINGVIEW_MCP_CACHE_WORKERS``   Worker count. Default 2, matching the
+                                    existing ``TRADINGVIEW_MCP_MAX_INFLIGHT``
+                                    precedent for upstream concurrency.
+``TRADINGVIEW_MCP_FAILURE_COOLDOWN_S``  Also used as the negative-cache TTL.
 """
 from __future__ import annotations
 
@@ -54,12 +67,21 @@ import sys
 import time
 from typing import Any, Callable, Dict, NamedTuple, Optional
 
+from tradingview_mcp.core.errors import is_error
 from tradingview_mcp.core.services.result_cache import ResultCache, cache_key_for
 
-__all__ = ["Job", "JobOutcome", "JobQueue", "WorkerPool", "default_worker_count"]
+__all__ = [
+    "Job",
+    "JobOutcome",
+    "JobQueue",
+    "WorkerPool",
+    "default_worker_count",
+    "default_error_ttl_s",
+]
 
 
 DEFAULT_WORKER_COUNT = 2
+FALLBACK_ERROR_TTL_S = 15.0
 
 
 def default_worker_count() -> int:
@@ -67,6 +89,22 @@ def default_worker_count() -> int:
         return max(1, int(os.environ.get("TRADINGVIEW_MCP_CACHE_WORKERS", str(DEFAULT_WORKER_COUNT))))
     except (TypeError, ValueError):
         return DEFAULT_WORKER_COUNT
+
+
+def default_error_ttl_s() -> float:
+    """Negative-cache TTL — the provider layer's own failure cooldown.
+
+    Imported from ``screener_provider`` so there is ONE definition of "how long
+    to leave a struggling upstream alone", not a copy that can drift. The
+    fallback only applies if that module cannot be imported (it depends on no
+    optional package, so this is defensive).
+    """
+    try:
+        from tradingview_mcp.core.services.screener_provider import _failure_cooldown_s
+
+        return max(0.0, float(_failure_cooldown_s()))
+    except Exception:
+        return FALLBACK_ERROR_TTL_S
 
 
 class Job(NamedTuple):
@@ -168,9 +206,11 @@ class WorkerPool:
         runners: Dict[str, Callable[..., Dict[str, Any]]],
         concurrency: Optional[int] = None,
         queue: Optional[JobQueue] = None,
+        error_ttl_s: Optional[float] = None,
     ) -> None:
         self.cache = cache
         self.runners = dict(runners)
+        self.error_ttl_s = float(error_ttl_s) if error_ttl_s is not None else default_error_ttl_s()
         self.concurrency = max(1, int(concurrency if concurrency is not None else default_worker_count()))
         self.queue = queue if queue is not None else JobQueue()
         self.workers: list[asyncio.Task] = []
@@ -279,8 +319,14 @@ class WorkerPool:
             self.queue.resolve(job.cache_key, JobOutcome(False, None, error))
             return
 
+        # A structured error envelope is a legitimate return value, so it IS
+        # cached -- but only for the short negative-cache window, never for the
+        # caller's full success TTL (see the module docstring).
+        cached_error = is_error(result)
+        ttl = min(self.error_ttl_s, job.ttl_s) if cached_error else job.ttl_s
+
         # Cache write happens off-loop too: sqlite3 is blocking IO.
-        await asyncio.to_thread(self.cache.put, job.tool, job.args, result, job.ttl_s)
+        await asyncio.to_thread(self.cache.put, job.tool, job.args, result, ttl)
         self.last_errors.pop(job.cache_key, None)
         self.queue.resolve(job.cache_key, JobOutcome(True, result, None))
 

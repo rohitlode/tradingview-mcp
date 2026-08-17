@@ -232,6 +232,102 @@ class TestCacheWriteThrough:
 
         assert cache.get("fake_tool", {"symbol": "AAPL"}) == {"value": 99}
 
+    def test_error_envelope_is_cached_under_the_short_negative_ttl(self, tmp_path):
+        """A transient upstream failure must not blank a symbol for the full
+        success window -- it gets the short negative-cache TTL instead."""
+        import sqlite3
+
+        envelope = {"error": {"code": "ALL_BATCHES_FAILED", "message": "upstream cliff"}}
+        recorder = _CallRecorder(result=envelope)
+        cache = ResultCache(db_path=tmp_path / "tool_cache.db")
+        pool = WorkerPool(
+            cache=cache, runners={"fake_tool": recorder}, concurrency=1, error_ttl_s=15.0
+        )
+
+        async def scenario():
+            await pool.start()
+            try:
+                return await pool.submit("fake_tool", {"symbol": "AAPL"}, ttl_s=120.0)
+            finally:
+                await pool.stop()
+
+        outcome = asyncio.run(scenario())
+
+        assert outcome.ok is True and outcome.result == envelope
+        with sqlite3.connect(str(cache.db_path)) as conn:
+            (stored_ttl,) = conn.execute("SELECT ttl_s FROM tool_result_cache").fetchone()
+        assert stored_ttl == 15.0, "error envelope was cached under the success TTL"
+
+    def test_successful_result_keeps_the_full_requested_ttl(self, tmp_path):
+        """Control for the test above -- a real success is NOT shortened."""
+        import sqlite3
+
+        recorder = _CallRecorder(result={"alignment": {"status": "BULLISH"}})
+        cache = ResultCache(db_path=tmp_path / "tool_cache.db")
+        pool = WorkerPool(
+            cache=cache, runners={"fake_tool": recorder}, concurrency=1, error_ttl_s=15.0
+        )
+
+        async def scenario():
+            await pool.start()
+            try:
+                await pool.submit("fake_tool", {"symbol": "AAPL"}, ttl_s=120.0)
+            finally:
+                await pool.stop()
+
+        asyncio.run(scenario())
+
+        with sqlite3.connect(str(cache.db_path)) as conn:
+            (stored_ttl,) = conn.execute("SELECT ttl_s FROM tool_result_cache").fetchone()
+        assert stored_ttl == 120.0
+
+    def test_cached_error_expires_quickly_while_a_success_stays_fresh(self, tmp_path):
+        """End-to-end freshness consequence: after ~20s of wall-clock age, the
+        error entry is a miss (retryable) but the success entry is still served."""
+        import sqlite3
+
+        cache = ResultCache(db_path=tmp_path / "tool_cache.db")
+
+        def runner(**kwargs):
+            if kwargs["symbol"] == "BROKEN":
+                return {"error": {"code": "ALL_BATCHES_FAILED", "message": "blip"}}
+            return {"ok": True}
+
+        pool = WorkerPool(
+            cache=cache, runners={"fake_tool": runner}, concurrency=2, error_ttl_s=15.0
+        )
+
+        async def scenario():
+            await pool.start()
+            try:
+                await asyncio.gather(
+                    pool.submit("fake_tool", {"symbol": "BROKEN"}, ttl_s=120.0),
+                    pool.submit("fake_tool", {"symbol": "GOOD"}, ttl_s=120.0),
+                )
+            finally:
+                await pool.stop()
+
+        asyncio.run(scenario())
+
+        # Age both rows by 20 seconds without sleeping.
+        with sqlite3.connect(str(cache.db_path)) as conn:
+            conn.execute("UPDATE tool_result_cache SET computed_at = computed_at - 20")
+
+        assert cache.get("fake_tool", {"symbol": "BROKEN"}, ttl_s=120.0) is None
+        assert cache.get("fake_tool", {"symbol": "GOOD"}, ttl_s=120.0) == {"ok": True}
+
+    def test_negative_ttl_default_tracks_the_provider_failure_cooldown(self, tmp_path):
+        """The default must come from the provider layer's own cooldown, not a
+        second invented constant that can drift."""
+        from tradingview_mcp.core.services import async_worker_pool as mod
+        from tradingview_mcp.core.services.screener_provider import _failure_cooldown_s
+
+        cache = ResultCache(db_path=tmp_path / "tool_cache.db")
+        pool = WorkerPool(cache=cache, runners={"fake_tool": _CallRecorder()})
+
+        assert pool.error_ttl_s == float(_failure_cooldown_s())
+        assert mod.default_error_ttl_s() == float(_failure_cooldown_s())
+
     def test_failing_job_caches_nothing_and_reports_the_error(self, tmp_path):
         recorder = _CallRecorder(exc=RuntimeError("upstream cliff"))
         cache, pool = _make_pool(tmp_path, recorder, concurrency=2)

@@ -97,6 +97,152 @@ class TestFreshState:
         assert out["status"] == "pending"
 
 
+    def test_caller_ttl_is_honoured_over_a_longer_stored_ttl(self, tmp_path):
+        """The tool's documented contract: `ttl_s` is MY freshness requirement.
+        An entry written under a long TTL must not be served as "fresh" to a
+        caller asking for a short one."""
+        import sqlite3
+
+        from tradingview_mcp.core.services.result_cache import cache_key_for
+
+        def runner(**kwargs):
+            return {"refetched": True}
+
+        cache, pool = _pool(tmp_path, runner)
+        args = {"symbol": "AAPL", "exchange": "NASDAQ"}
+        cache.put("multi_timeframe_analysis", args, {"stale": True}, ttl_s=3600.0)
+        key = cache_key_for("multi_timeframe_analysis", args)
+        with sqlite3.connect(str(cache.db_path)) as conn:
+            conn.execute(
+                "UPDATE tool_result_cache SET computed_at = computed_at - 60 WHERE cache_key = ?",
+                (key,),
+            )
+
+        async def scenario():
+            await pool.start()
+            try:
+                strict = await svc.serve_cached_analysis(
+                    "multi_timeframe_analysis", "AAPL", "NASDAQ", 30.0, pool=pool
+                )
+                await pool.drain(timeout=5.0)
+                relaxed_after_refresh = await svc.serve_cached_analysis(
+                    "multi_timeframe_analysis", "AAPL", "NASDAQ", 30.0, pool=pool
+                )
+                return strict, relaxed_after_refresh
+            finally:
+                await pool.stop()
+
+        strict, refreshed = asyncio.run(scenario())
+
+        assert strict["status"] == "pending", "60s-old row served to a 30s-ttl caller"
+        assert refreshed["status"] == "fresh"
+        assert refreshed["result"] == {"refetched": True}
+
+    def test_a_generous_caller_still_gets_the_existing_entry(self, tmp_path):
+        """Control: the stricter-of-the-two rule must not turn every hit into a
+        miss -- a caller whose window covers the row still gets it."""
+        import sqlite3
+
+        from tradingview_mcp.core.services.result_cache import cache_key_for
+
+        calls = {"n": 0}
+
+        def runner(**kwargs):
+            calls["n"] += 1
+            return {}
+
+        cache, pool = _pool(tmp_path, runner)
+        args = {"symbol": "AAPL", "exchange": "NASDAQ"}
+        cache.put("multi_timeframe_analysis", args, {"cached": True}, ttl_s=3600.0)
+        with sqlite3.connect(str(cache.db_path)) as conn:
+            conn.execute(
+                "UPDATE tool_result_cache SET computed_at = computed_at - 60 WHERE cache_key = ?",
+                (cache_key_for("multi_timeframe_analysis", args),),
+            )
+
+        async def scenario():
+            await pool.start()
+            try:
+                return await svc.serve_cached_analysis(
+                    "multi_timeframe_analysis", "AAPL", "NASDAQ", 300.0, pool=pool
+                )
+            finally:
+                await pool.stop()
+
+        out = asyncio.run(scenario())
+
+        assert out["status"] == "fresh"
+        assert out["result"] == {"cached": True}
+        assert calls["n"] == 0
+
+
+class TestNegativeCaching:
+    def test_upstream_failure_is_retried_soon_not_after_the_full_ttl(self, tmp_path):
+        """A transient ALL_BATCHES_FAILED must not blank the symbol for 120s."""
+        import sqlite3
+
+        from tradingview_mcp.core.errors import BatchExecutionError
+        from tradingview_mcp.core.services import cached_analysis_service as mod
+
+        attempts = {"n": 0}
+
+        def flaky_underlying(full_symbol, exchange):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise BatchExecutionError(
+                    batches_attempted=5, batches_failed=5, first_error="Expecting value",
+                )
+            return {"alignment": {"status": "BULLISH"}}
+
+        cache = ResultCache(db_path=tmp_path / "tool_cache.db")
+        pool = WorkerPool(
+            cache=cache,
+            runners={"multi_timeframe_analysis": mod.run_multi_timeframe_job},
+            concurrency=1,
+            error_ttl_s=15.0,
+        )
+
+        async def scenario(monkeypatched):
+            await pool.start()
+            try:
+                await svc.serve_cached_analysis(
+                    "multi_timeframe_analysis", "AAPL", "NASDAQ", 120.0, pool=pool
+                )
+                await pool.drain(timeout=5.0)
+                errored = await svc.serve_cached_analysis(
+                    "multi_timeframe_analysis", "AAPL", "NASDAQ", 120.0, pool=pool
+                )
+                # 20s later the failure entry is dead even though the caller's
+                # own TTL is 120s -- so the symbol is retried, not blanked.
+                with sqlite3.connect(str(cache.db_path)) as conn:
+                    conn.execute("UPDATE tool_result_cache SET computed_at = computed_at - 20")
+                retried = await svc.serve_cached_analysis(
+                    "multi_timeframe_analysis", "AAPL", "NASDAQ", 120.0, pool=pool
+                )
+                await pool.drain(timeout=5.0)
+                recovered = await svc.serve_cached_analysis(
+                    "multi_timeframe_analysis", "AAPL", "NASDAQ", 120.0, pool=pool
+                )
+                return errored, retried, recovered
+            finally:
+                await pool.stop()
+
+        import unittest.mock as um
+
+        with um.patch.object(mod, "run_multi_timeframe_analysis", flaky_underlying):
+            errored, retried, recovered = asyncio.run(scenario(True))
+
+        # The failure was served from cache immediately after it happened...
+        assert errored["status"] == "fresh"
+        assert errored["result"]["error"]["code"] == "ALL_BATCHES_FAILED"
+        # ...but expired ~15s later, triggering a real retry...
+        assert retried["status"] == "pending"
+        # ...which succeeded.
+        assert recovered["status"] == "fresh"
+        assert recovered["result"] == {"alignment": {"status": "BULLISH"}}
+        assert attempts["n"] == 2
+
+
 class TestPendingState:
     def test_cache_miss_returns_pending_immediately_and_enqueues_a_real_job(self, tmp_path):
         import time

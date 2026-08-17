@@ -6,6 +6,14 @@
 **Spec:** `tradesignalservice/.../docs/superpowers/specs/2026-08-17-tradingview-mcp-async-cache-design.md`, sections 1–3 and 5
 **Live service on :8100:** untouched — never restarted, never redeployed.
 
+> **Round 2 (post-review).** Three Important review findings were fixed in a
+> follow-up commit: the caller's `ttl_s` was silently ignored on a cache hit;
+> cached error envelopes poisoned a symbol for the full success TTL; and the
+> as-built tool signature deviated from the design spec without being flagged.
+> See **§9** for what changed, the RED/GREEN evidence, and the corrected
+> estimates. Sections 1–8 below have been updated in place to describe the
+> current code, so they are accurate as they stand.
+
 ---
 
 ## 1. What was built
@@ -28,9 +36,11 @@ tool_result_cache(cache_key TEXT PRIMARY KEY, tool TEXT, args_json TEXT,
 
 `cache_key = sha256(tool + canonical_json(args))` where canonical JSON is
 `sort_keys=True, separators=(",",":")` — so argument ordering can never change
-the key. `get()` returns `None` for missing, expired (`now - computed_at >
-ttl_s`), or corrupt rows. `put()` is `INSERT OR REPLACE`. A `purge_expired()`
-helper exists but is not yet called on any schedule (see §6).
+the key. `get(tool, args, ttl_s=None)` returns `None` for missing, corrupt, or
+expired rows, where **expired means older than `min(requested_ttl_s,
+stored_ttl_s)`** — the caller's freshness requirement is honoured strictly
+(§9.1). `put()` is `INSERT OR REPLACE`. `purge_expired()` runs once per pool
+build (§9.4).
 
 ### `src/tradingview_mcp/core/services/async_worker_pool.py`
 
@@ -112,10 +122,15 @@ immediately. Unsupported `tool` → `INVALID_PARAMETER` error envelope.
    spec only names `fresh`/`pending`; I added a field rather than a third
    status so the documented contract is unchanged.
 
-4. **`BatchExecutionError` results ARE cached.** That error envelope is a
-   documented legitimate return value of `multi_timeframe_analysis`. Caching it
-   stops an upstream cliff from being re-hammered once per poll for the whole
-   TTL. Genuine unexpected exceptions (item 3) are *not* cached.
+4. **`BatchExecutionError` results ARE cached — but only briefly.** That error
+   envelope is a documented legitimate return value of
+   `multi_timeframe_analysis`. Caching it stops an upstream cliff from being
+   re-hammered once per poll. But it is stored under a **separate short
+   negative-cache TTL** (`min(error_ttl_s, requested_ttl_s)`), defaulting to
+   the provider layer's own `TRADINGVIEW_MCP_FAILURE_COOLDOWN_S` (15s) —
+   *not* the 120s success TTL, which would blank a symbol for two minutes over
+   a blip that often clears in seconds (§9.2). Genuine unexpected exceptions
+   (item 3) are not cached at all.
 
 5. **`asyncio.to_thread` also wraps the sqlite reads/writes**, not just the
    upstream fetch. sqlite3 is blocking IO; keeping it off the loop is consistent
@@ -231,12 +246,13 @@ requests for the same symbol produced exactly one upstream fetch.
 
 ```
 $ .venv/bin/python -m pytest tests/ -q
-174 passed in 5.72s
+186 passed in 5.75s
 ```
 
 - Pre-existing: 139, all still green.
-- New: 35 (`test_result_cache.py` 11, `test_async_worker_pool.py` 13,
-  `test_get_cached_analysis.py` 11).
+- New: 47 — round 1 added 35, round 2 added 12
+  (`test_result_cache.py` 16, `test_async_worker_pool.py` 17,
+  `test_get_cached_analysis.py` 14).
 - No new dependency; no pytest config change.
 
 Existing-tools-untouched is asserted **in code**, not just by eyeballing the
@@ -272,16 +288,27 @@ were already untracked on `main` before this session and were **not** committed.
 
 1. **The service must be restarted to expose the new tool.** Operator's own
    decision, deliberately not done. Until then, TSS's side has nothing to call.
-2. **Only `multi_timeframe_analysis` is cached.** `market_sentiment` and
-   `compare_strategies` (the other two calls in TSS's `TechnicalCheckStage`) go
-   through the direct path unchanged. They're advisory/fail-soft on the TSS
-   side, so this was the right thing to leave. Generalising is a small,
-   mechanical follow-up (`TOOL_RUNNERS` + a wrapper each).
-3. **No cache eviction is scheduled.** `purge_expired()` exists but nothing
-   calls it. Row count grows with distinct (tool, symbol, exchange) triples;
-   for a few thousand symbols that's a few MB, so this is a housekeeping item,
-   not a risk. Suggested follow-up: purge on pool start.
-4. **`WorkerPool.stop()` is never wired to a server-shutdown hook.** FastMCP's
+2. **Only `multi_timeframe_analysis` is cached, and generalising is NOT
+   trivial** (corrected in round 2 — the original estimate here was wrong).
+   `market_sentiment` and `compare_strategies` (the other two calls in TSS's
+   `TechnicalCheckStage`) go through the direct path unchanged; they're
+   advisory/fail-soft on the TSS side, so leaving them was right. But because
+   the tool signature is flat `symbol`/`exchange` rather than the spec's
+   generic `args: dict` (§9.3), a tool with a different parameter shape —
+   `market_sentiment` takes `category`/`limit`, `compare_strategies` takes
+   strategy parameters — cannot be added with just a `TOOL_RUNNERS` entry plus
+   a wrapper. It needs a real per-tool parameter mapping: either per-tool
+   optional parameters on the tool signature, a separate cached tool per
+   underlying tool, or reintroducing a generic `args` object alongside the flat
+   form. That is a design decision, not a mechanical edit.
+3. **Cache eviction is minimal but wired.** `purge_expired()` now runs once per
+   pool build (effectively once per process, off-loop, best-effort). There is
+   no periodic purge. Row count grows with distinct (tool, symbol, exchange)
+   triples; for a few thousand symbols that is a few MB, so a periodic sweep is
+   a housekeeping nicety, not a risk.
+4. **`WorkerPool.stop()` / `shutdown_pool()` are intentionally deferred
+   infrastructure.** `shutdown_pool()` is exercised by the live smoke test but
+   is not wired to a server-shutdown hook — FastMCP's
    lifespan wasn't touched; on process exit the tasks die with the loop. A
    cancelled mid-flight job resolves its future as `cancelled` and releases its
    key, so nothing is left permanently in-flight, but a fetch in progress at
@@ -293,3 +320,151 @@ were already untracked on `main` before this session and were **not** committed.
    do one sqlite read per poll. TSS's planned ~2 s cadence is fine.
 7. **Section 4/6 of the spec (the TSS-side `TechnicalCheckStage` change) was
    explicitly out of scope** for this task and was not touched.
+
+---
+
+## 9. Round 2 — post-review fixes (2026-08-17)
+
+Three Important review findings. All three were real contract/correctness bugs
+and all three are fixed, each with a test proven non-vacuous by reverting the
+fix and watching the test fail.
+
+### 9.1 `ttl_s` was silently ignored on a cache hit (contract was false)
+
+**The bug.** `ResultCache.get(tool, args)` expired only against the STORED
+`ttl_s` — whatever the first writer used. A caller asking for a 30-second
+freshness window could be handed a 60-second-old row labelled `"fresh"`,
+because some earlier caller wrote it with `ttl_s=3600`. The tool docstring
+promised the caller's window was honoured, and `ResultCache`'s own docstring
+went further, claiming "different callers can ask for different freshness
+windows against the same table without invalidating each other" — which is not
+what the code did. For data that eventually feeds trading decisions, silently
+serving stale-but-labelled-fresh is the wrong failure mode.
+
+**The fix.** `get()` now takes the requester's `ttl_s` and expires against
+**`min(requested, stored)`**. The strictness is symmetric and deliberate:
+- a caller demanding *fresher* data than the writer asked for gets a miss and
+  triggers a refetch (the important direction);
+- a caller asking for a *longer* window still cannot resurrect a short-lived
+  row — which is exactly what makes negative caching (§9.2) work.
+
+`ttl_s=None` still means "trust the stored TTL", for callers with no freshness
+requirement of their own. An unusable value (non-numeric) falls back to the
+stored TTL rather than raising. Both docstrings were rewritten to describe the
+implemented behaviour, and `serve_cached_analysis` now threads the caller's ttl
+into the read.
+
+**Tests added:** `test_requested_ttl_stricter_than_stored_ttl_wins`,
+`test_stored_ttl_stricter_than_requested_ttl_wins`,
+`test_omitting_ttl_falls_back_to_the_stored_ttl`,
+`test_unusable_requested_ttl_falls_back_to_stored`,
+`TestFreshState::test_caller_ttl_is_honoured_over_a_longer_stored_ttl`,
+`test_a_generous_caller_still_gets_the_existing_entry` (the control — the rule
+must not turn every hit into a miss).
+
+**RED proof** — the `min()` was reverted to stored-TTL-only:
+
+```
+FAILED test_get_cached_analysis.py::TestFreshState::test_caller_ttl_is_honoured_over_a_longer_stored_ttl - AssertionError: 60s-old row served to a 30s-ttl caller
+FAILED test_result_cache.py::TestResultCache::test_requested_ttl_stricter_than_stored_ttl_wins - AssertionError: assert {'v': 1} is None
+2 failed, 184 passed
+```
+
+### 9.2 Cached error envelopes poisoned a symbol for the full success TTL
+
+**The bug.** A transient `ALL_BATCHES_FAILED` was cached under the caller's
+success TTL (120s default). TSS's `TechnicalCheckStage` would then degrade-block
+that symbol for two full minutes with zero retry, even though the upstream blip
+these fetches suffer from often clears in seconds.
+
+**The fix.** `WorkerPool` gained an `error_ttl_s`. `_run_job` classifies the
+result with the repo's own shared `errors.is_error()` helper and stores an
+error envelope under `min(error_ttl_s, job.ttl_s)` instead of `job.ttl_s`.
+
+The default is **not a new invented constant**: `default_error_ttl_s()` imports
+`screener_provider._failure_cooldown_s()` (env
+`TRADINGVIEW_MCP_FAILURE_COOLDOWN_S`, default 15s) — the provider layer's own
+"give a struggling upstream room to recover" number, so there is one definition
+that cannot drift. A hard-coded 15.0 fallback applies only if that import fails
+(defensive; that module has no optional dependencies). A test asserts the pool's
+value tracks the provider function rather than a literal.
+
+This keeps both properties that matter: a polling caller still cannot re-hammer
+a struggling upstream (it gets the cached error for ~15s), but a blip no longer
+blanks the symbol for the whole 120s window.
+
+**Tests added:** `test_error_envelope_is_cached_under_the_short_negative_ttl`
+(asserts the stored `ttl_s` column is 15.0, not 120.0),
+`test_successful_result_keeps_the_full_requested_ttl` (the control — successes
+are not shortened), `test_cached_error_expires_quickly_while_a_success_stays_fresh`
+(ages both rows 20s: the error is a miss, the success is still served),
+`test_negative_ttl_default_tracks_the_provider_failure_cooldown`, and an
+end-to-end `TestNegativeCaching::test_upstream_failure_is_retried_soon_not_after_the_full_ttl`
+that drives the REAL `run_multi_timeframe_job` with a flaky underlying function
+and proves the full cycle: error cached → served `fresh` → expires ~15s later →
+`pending` retry → recovers to a real result, with exactly 2 underlying attempts.
+
+**RED proof** — the TTL selection was reverted to always `job.ttl_s`:
+
+```
+FAILED test_async_worker_pool.py::TestCacheWriteThrough::test_error_envelope_is_cached_under_the_short_negative_ttl - AssertionError: error envelope was cached under the success TTL
+FAILED test_async_worker_pool.py::TestCacheWriteThrough::test_cached_error_expires_quickly_while_a_success_stays_fresh - AssertionError: assert {'error': {'code': 'ALL_BATCHES_FAILED', ...
+FAILED test_get_cached_analysis.py::TestNegativeCaching::test_upstream_failure_is_retried_soon_not_after_the_full_ttl - AssertionError: assert 'fresh' == 'pending'
+3 failed, 183 passed
+```
+
+### 9.3 Signature deviation from the design spec was not flagged
+
+**What happened.** The design spec specifies
+`get_cached_analysis(tool: str, args: dict, ttl_s: float = 120.0)`. What was
+built takes flat `symbol`/`exchange` parameters. Round 1's report presented the
+as-built signature without noting the deviation. Not a functional problem — the
+TSS-side task was briefed against the as-built signature, so the two sides are
+consistent — but an undocumented drift between spec and code.
+
+**Why flat parameters (the reason that should have been stated up front):** MCP
+tool schemas are derived from the Python signature, so a flat, typed signature
+gives a calling agent a real parameter schema with types and defaults, rather
+than an opaque free-form object it has to guess the shape of.
+
+**Fixes applied.**
+1. The design spec itself now carries an **AS-BUILT CORRECTION** note recording
+   the real signature, the reason, the TTL semantics from §9.1, and the negative
+   caching from §9.2 (which the original design did not mention at all).
+2. **§8.2 of this report is corrected.** The round-1 claim that generalising to
+   other tools is "one `TOOL_RUNNERS` entry plus a wrapper" was wrong, and the
+   flat signature is precisely why. `TOOL_RUNNERS` handles the *dispatch*, but
+   the flat signature only carries `symbol`/`exchange` — a tool with a different
+   parameter shape (`market_sentiment`: `category`/`limit`; `compare_strategies`:
+   strategy parameters) has no way to receive its arguments. Extending the cache
+   to those tools requires a real per-tool parameter mapping: per-tool optional
+   parameters on the tool signature, one cached tool per underlying tool, or
+   reintroducing a generic `args` object alongside the flat form. That is a
+   design decision, not a mechanical edit.
+
+### 9.4 `purge_expired()` / `shutdown_pool()` (the non-blocking note)
+
+- **`purge_expired()` is now wired.** `get_pool()` calls it once per pool build
+  (effectively once per process), off-loop via `asyncio.to_thread`, best-effort.
+  A test (`test_purge_expired_removes_only_dead_rows`) proves it removes exactly
+  the dead rows and leaves live ones. No periodic sweep — see §8.3.
+- **`shutdown_pool()` remains intentionally deferred.** It is exercised by the
+  live smoke test but is not wired to a FastMCP shutdown hook; FastMCP's
+  lifespan was deliberately not touched in a purely-additive change. On process
+  exit the worker tasks die with the loop, a cancelled mid-flight job resolves
+  as `cancelled` and releases its key, so nothing is left permanently in-flight
+  — a fetch in progress at shutdown is simply discarded. Recorded in §8.4 as
+  deferred rather than silently left as an unreferenced export.
+
+### 9.5 Round 2 verification
+
+```
+$ .venv/bin/python -m pytest tests/ -q
+186 passed in 5.75s
+```
+
+139 pre-existing (all still green) + 47 new. Both round-1 properties (de-dup,
+bounded concurrency) were re-proven non-vacuous in round 1 and remain green
+unchanged. `server.py` remains additive-only: the sole round-2 edit there is
+an expanded `ttl_s` docstring on the new tool — no existing tool touched, and
+the signature-pinning tests still pass.
