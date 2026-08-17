@@ -42,6 +42,7 @@ from tradingview_mcp.core.services.egx_service import (
     generate_egx_trade_plan,
     analyze_egx_fibonacci,
 )
+from tradingview_mcp.core.services.cached_analysis_service import serve_cached_analysis
 from tradingview_mcp.core.services.sentiment_service import analyze_sentiment
 from tradingview_mcp.core.services.news_service import fetch_news_summary
 from tradingview_mcp.core.services.yahoo_finance_service import (
@@ -537,6 +538,47 @@ def multi_timeframe_analysis(symbol: str, exchange: str = "KUCOIN") -> dict:
             batches_failed=e.batches_failed,
             first_error=e.first_error,
         )
+
+
+# ── Cached / async analysis ────────────────────────────────────────────────────
+
+@mcp.tool()
+async def get_cached_analysis(
+    tool: str,
+    symbol: str,
+    exchange: str = "NASDAQ",
+    ttl_s: float = 120.0,
+) -> dict:
+    """Non-blocking, cached access to an expensive analysis tool.
+
+    Use this instead of calling the underlying tool directly when you are
+    scanning many symbols and cannot afford a 20-30s cold upstream fetch per
+    symbol. It NEVER waits for a fetch:
+
+      * If a result computed within the last `ttl_s` seconds exists, it is
+        returned inline: `{"status": "fresh", "result": {...}}`.
+      * Otherwise a background job is queued and `{"status": "pending"}` is
+        returned immediately. Poll again (e.g. every 2s) until it turns
+        `fresh`, and fall back / give up on your own timeout budget.
+
+    Concurrent requests for the same symbol collapse into ONE upstream fetch,
+    and at most a small fixed number of fetches run at a time, so hammering
+    this tool cannot amplify load on the upstream data source.
+
+    Args:
+        tool: Underlying tool to serve. Currently only
+            "multi_timeframe_analysis". Any other name returns an
+            INVALID_PARAMETER error envelope — call that tool directly.
+        symbol: Symbol, same form the underlying tool accepts ("AAPL", "BTCUSDT").
+        exchange: Exchange, same form the underlying tool accepts. Default NASDAQ.
+        ttl_s: How fresh a cached result must be to count as a hit. Default 120.
+
+    Returns:
+        {"status": "fresh", "tool", "args", "result": {...}} or
+        {"status": "pending", "tool", "args"[, "last_error"]} or
+        {"error": {"code": "INVALID_PARAMETER", ...}}.
+    """
+    return await serve_cached_analysis(tool, symbol, exchange, ttl_s)
 
 
 # ── Sentiment & news tools ─────────────────────────────────────────────────────
