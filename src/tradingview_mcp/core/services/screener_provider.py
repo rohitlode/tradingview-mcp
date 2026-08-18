@@ -11,6 +11,28 @@ import time as _time
 from threading import RLock as _RLock, Semaphore as _Semaphore, Lock as _Lock
 
 
+def _diagnostic_suffix(e: BaseException, proxies: Optional[dict]) -> str:
+    """Extra debug context for a transient-error log line (2026-08-17 investigation).
+
+    ``JSONDecodeError`` doesn't say WHAT failed to parse -- its own ``.doc``
+    attribute (the raw text the json module tried to parse) does, and is
+    otherwise thrown away by every existing log line. An empty ``.doc`` means
+    the upstream/proxy returned a 200 with an empty body; a non-empty ``.doc``
+    (e.g. an HTML error page or a JSON error envelope) points somewhere
+    completely different. Also notes whether this attempt actually went
+    through the configured proxy (a "-rotate" account hands Webshare a
+    different exit IP per TCP connection but always presents the SAME
+    literal username here, so the username can't distinguish exit IPs -- it
+    can only confirm the proxy was engaged at all, not silently bypassed).
+    """
+    parts = []
+    doc = getattr(e, "doc", None)
+    if doc is not None:
+        parts.append(f"raw_body={doc[:200]!r}")
+    parts.append(f"via_proxy={bool(proxies)}")
+    return (" | " + " ".join(parts)) if parts else ""
+
+
 # --- Socket-level timeout (added 2026-05-20) ------------------------------
 # Critical: tradingview_ta and tradingview-screener use urllib without an
 # explicit timeout, so when scanner.tradingview.com opens a connection then
@@ -339,7 +361,7 @@ def _scan_with_retry(q, cookies=None, cache_key: Optional[Tuple] = None):
             try:
                 print(
                     f"[tradingview_mcp] transient scanner error (attempt {i+1}/{len(delays)}, "
-                    f"slept {wait:.1f}s): {e!r}",
+                    f"slept {wait:.1f}s): {e!r}{_diagnostic_suffix(e, get_proxy())}",
                     file=_sys.stderr,
                 )
             except Exception:
@@ -416,7 +438,7 @@ def resilient_get_multiple_analysis(screener, interval, symbols):
             try:
                 print(
                     f"[tradingview_mcp] transient TA error (attempt {i+1}/{len(delays)}, "
-                    f"slept {wait:.1f}s): {e!r}",
+                    f"slept {wait:.1f}s): {e!r}{_diagnostic_suffix(e, get_proxy())}",
                     file=_sys.stderr,
                 )
             except Exception:
