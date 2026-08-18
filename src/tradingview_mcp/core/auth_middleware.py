@@ -53,8 +53,22 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
         client_host = request.client.host if request.client else None
         if client_host in _LOOPBACK_HOSTS:
             return await call_next(request)
+        if hmac.compare_digest(self._presented_token(request), self._token):
+            return await call_next(request)
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    def _presented_token(self, request: Request) -> str:
+        """Header takes precedence; ``?token=`` is a same-length fallback for
+        clients that can't set a custom header (e.g. a bare browser tab).
+
+        Query-string tokens are weaker than a header -- they can end up in
+        Tailscale's own edge access logs, browser history, and Referer
+        headers on any onward navigation. Prefer the header when the client
+        supports it; this fallback exists for convenience, not as the
+        recommended path.
+        """
         auth = request.headers.get("authorization", "")
         scheme, _, presented = auth.partition(" ")
-        if scheme.lower() != "bearer" or not hmac.compare_digest(presented, self._token):
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return await call_next(request)
+        if scheme.lower() == "bearer" and presented:
+            return presented
+        return request.query_params.get("token", "")
