@@ -923,7 +923,31 @@ def main() -> None:
             mcp.settings.port = args.port
         except Exception:
             pass
-        mcp.run(transport="streamable-http")
+
+        from tradingview_mcp.core.auth_middleware import BearerTokenMiddleware, get_bearer_token
+
+        token = get_bearer_token()
+        if args.host not in ("127.0.0.1", "localhost", "::1") and not token:
+            raise SystemExit(
+                f"Refusing to bind to {args.host} (non-loopback) without MCP_BEARER_TOKEN "
+                "set -- this server has no other auth. Set it in .env, or bind to "
+                "127.0.0.1 for local-only use."
+            )
+
+        import asyncio
+        import uvicorn
+
+        starlette_app = mcp.streamable_http_app()
+        if token:
+            starlette_app.add_middleware(BearerTokenMiddleware, token=token)
+
+        config = uvicorn.Config(
+            starlette_app,
+            host=mcp.settings.host,
+            port=mcp.settings.port,
+            log_level=mcp.settings.log_level.lower(),
+        )
+        asyncio.run(uvicorn.Server(config).serve())
 
 
 if __name__ == "__main__":
